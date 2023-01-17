@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+
+import socket
+import ssl
+import json
+import argparse
+
+# Loads Wordle solutions from a .txt file into a set
+def load_solutions():
+    with open('wordle_solutions.txt') as solution_file:
+        solutions = set(solution_file.read().split())
+    return solutions
+
+# Set up argument parser
+parser = argparse.ArgumentParser(usage='./client <-p port> <-s> <hostname> <username>')
+parser.add_argument('-p', type=int, dest='port')
+parser.add_argument('-s', action='store_true', dest='tls_connection')
+parser.add_argument('hostname')
+parser.add_argument('username')
+args = parser.parse_args()
+
+# Set up constants
+SOLUTIONS = set(load_solutions())
+BUFFER = 1024
+
+def main():
+    if (args.port is None):
+        if (not args.tls_connection):
+            port = 27993
+        else:
+            port = 27994
+    else:
+        port = args.port
+    
+    client(port, args.tls_connection, args.hostname, args.username)
+
+# Sets up the socket connection
+def client(port, tls_connection, hostname, username):
+    hello = {
+        "type": "hello", 
+        "northeastern_username": username
+    }
+    hello_json = json.dumps(hello) + '\n'
+    
+    # Set up socket and create TLS connection if necessary
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if (tls_connection):
+            s = ssl.wrap_socket(s)
+
+    # Send hello message to get secret id
+    try:
+        s.connect((hostname, port))
+        s.sendall(hello_json.encode())
+        secret_code = s.recv(BUFFER).decode()
+        user_id = json.loads(secret_code)['id']
+        start_game(user_id, s)
+    except:
+        print('Failed to connect')
+        return
+    
+
+# Plays Wordle game using feedback from server
+def start_game(user_id, s):
+    # Send over first guess
+    first_guess = format_guess(user_id, 'prude')
+    s.sendall(first_guess.encode())
+    response = s.recv(BUFFER).decode()
+
+    # Initialize the set of the letters already used
+    used_letters = set()
+
+    # Loop until we find the answer/secret flag
+    while True:
+        json_response = json.loads(response)
+        if (json_response['type'] == 'retry'):
+            new_guess, used_letters = find_word(json_response, used_letters)
+            s.sendall(format_guess(user_id, new_guess).encode())
+            response = s.recv(BUFFER).decode()
+        elif(json_response['type'] == 'bye'):
+            print(json_response['flag'])
+            return
+
+
+# Formats a guess in json
+def format_guess(user_id, word):
+    return json.dumps({ "type": "guess", "id": user_id, "word": word}) + '\n'
+
+# Finds a valid word from the solution set
+def find_word(json_response, used_letters):
+    guesses = json_response['guesses']
+    print(len(guesses))
+    old_guesses = [a['word'] for a in guesses]
+
+    # Get information from the last guess
+    guess = guesses.pop()
+    old_word = guess['word']
+    marks = guess['marks']
+
+    # Adds the gray letters to the used letters so we do not repeat them
+    new_used_letters = add_used_letters(old_word, marks, used_letters)
+
+    for new_word in SOLUTIONS:
+        # Invalid solution flag because of multi-loop
+        invalid_solution = False
+
+        # Take note of feedback in case of yellow
+        new_feedback = [0, 0, 0, 0, 0]
+
+        if (old_guesses.__contains__(new_word)):
+            continue
+
+        for i in range (0, len(new_word)):
+            # Green case
+            if marks[i] == 2 and new_word[i] != old_word[i]:
+                invalid_solution = True
+                break
+            elif marks[i] == 2 and new_word[i] == old_word[i]:
+                new_feedback[i] = 2
+
+            # Yellow case
+            elif marks[i] == 1 and new_word[i] == old_word[i]:
+                invalid_solution = True
+                break
+            elif marks[i] == 1 and new_word[i] != old_word[i]:
+                # Seeing if the letter exists somewhere else in the possible word
+                flag = True
+                for j in range(0, len(new_word)):
+                    if old_word[i] == new_word[j]:
+                        if new_feedback[j] == 0:
+                            new_feedback[j] = 1
+                            flag = False
+                            break
+                if flag:
+                    invalid_solution = True
+                    break
+            
+            # Gray case
+            elif(new_used_letters.__contains__(new_word[i])):
+                invalid_solution = True
+                break
+        
+        # Check if invalid solution flag was raised
+        if (not invalid_solution):
+            return new_word, new_used_letters
+
+def add_used_letters(old_word, marks, used_letters):
+        # Make a copy of used letters
+        new_used_letters = used_letters.copy()
+
+        # Keeps track of not gray letters (green or yellow), so we do not accidentally add letters that are in the
+        # word, but are grayed out elsewhere
+        not_gray = set()
+
+        for position in range(0, len(old_word)):
+            # Add grayed out letters to the used letters
+            if marks[position] == 0:
+                if not not_gray.__contains__(old_word[position]):
+                    new_used_letters.add(old_word[position])
+
+            if marks[position] == 1 or marks[position] == 2:
+                not_gray.add(old_word[position])
+                if new_used_letters.__contains__(old_word[position]):
+                    new_used_letters.remove(old_word[position])
+
+        return new_used_letters
+
+
+if __name__ == '__main__':
+    main()
